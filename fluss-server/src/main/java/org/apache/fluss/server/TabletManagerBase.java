@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server;
 
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.LogStorageException;
@@ -32,6 +33,7 @@ import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
+import org.apache.fluss.utils.StringUtils;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 
 import org.slf4j.Logger;
@@ -40,10 +42,13 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -53,9 +58,9 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
-import static org.apache.fluss.utils.FlussPaths.KV_TABLET_DIR_PREFIX;
-import static org.apache.fluss.utils.FlussPaths.LOG_TABLET_DIR_PREFIX;
 import static org.apache.fluss.utils.FlussPaths.isPartitionDir;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+import static org.apache.fluss.utils.Preconditions.checkState;
 
 /**
  * A base class for {@link LogManager} {@link KvManager} which provide a common logic for both of
@@ -71,7 +76,7 @@ public abstract class TabletManagerBase {
         KV
     }
 
-    protected final File dataDir;
+    protected final List<File> dataDirs;
 
     protected final Configuration conf;
 
@@ -80,15 +85,73 @@ public abstract class TabletManagerBase {
     // TODO make this parameter configurable.
     private final int recoveryThreads;
     private final TabletType tabletType;
-    private final String tabletDirPrefix;
 
-    public TabletManagerBase(
-            TabletType tabletType, File dataDir, Configuration conf, int recoveryThreads) {
+    public TabletManagerBase(TabletType tabletType, Configuration conf, int recoveryThreads) {
         this.tabletType = tabletType;
-        this.tabletDirPrefix = getTabletDirPrefix(tabletType);
-        this.dataDir = dataDir;
+
+        String dataDirsString = conf.getString(ConfigOptions.DATA_DIR);
+        checkArgument(
+                !StringUtils.isNullOrWhitespaceOnly(dataDirsString),
+                "The option %s is empty.",
+                ConfigOptions.DATA_DIR.key());
+
+        List<File> dataDirs = new ArrayList<>();
+        for (String dataDirString : dataDirsString.split(",")) {
+            if (StringUtils.isNullOrWhitespaceOnly(dataDirString)) {
+                continue;
+            }
+            File dataDir = new File(dataDirString).getAbsoluteFile();
+            dataDirs.add(dataDir);
+        }
+        checkArgument(!dataDirs.isEmpty(), "The number of data directories is zero.");
+        this.dataDirs = dataDirs;
+
         this.conf = conf;
         this.recoveryThreads = recoveryThreads;
+    }
+
+    private Map<File, List<File>> getTabletDirs() {
+        checkState(dataDirs.isEmpty(), "The number of data directories is zero.");
+
+        Map<File, List<File>> tabletDirs = new HashMap<>();
+        for (File dataDir : dataDirs) {
+            List<File> dataDirTabletDirs = new ArrayList<>();
+            // Get all database directory.
+            File[] dbDirs = FileUtils.listDirectories(dataDir);
+            for (File dbDir : dbDirs) {
+                // Get all table path directory.
+                File[] tableDirs = FileUtils.listDirectories(dbDir);
+                for (File tableDir : tableDirs) {
+                    // maybe tablet directories or partition directories
+                    File[] tabletOrPartitionDirs = FileUtils.listDirectories(tableDir);
+                    for (File tabletOrPartitionDir : tabletOrPartitionDirs) {
+                        // if not partition dir, consider it as a tablet dir
+                        if (!isPartitionDir(tabletOrPartitionDir.getName())) {
+                            dataDirTabletDirs.add(tabletOrPartitionDir);
+                        } else {
+                            // consider all dirs in partition as tablet dirs
+                            dataDirTabletDirs.addAll(
+                                    Arrays.asList(FileUtils.listDirectories(tabletOrPartitionDir)));
+                        }
+                    }
+                }
+            }
+            tabletDirs.put(dataDir, dataDirTabletDirs);
+        }
+        return tabletDirs;
+    }
+
+    private File getPreferredDataDir() {
+        Map<File, List<File>> allTabletDirs = getTabletDirs();
+        Map.Entry<File, List<File>> preferredDataDir =
+                allTabletDirs.entrySet().stream()
+                        .sorted(
+                                Comparator.comparing(
+                                        (Map.Entry<File, List<File>> e) ->
+                                                e.getValue() != null ? e.getValue().size() : 0))
+                        .collect(Collectors.toList())
+                        .get(0);
+        return preferredDataDir.getKey();
     }
 
     /**
@@ -99,41 +162,11 @@ public abstract class TabletManagerBase {
      * TableBucket)}.
      */
     protected List<File> listTabletsToLoad() {
-        List<File> tabletsToLoad = new ArrayList<>();
-        // Get all database directory.
-        File[] dbDirs = FileUtils.listDirectories(dataDir);
-        for (File dbDir : dbDirs) {
-            // Get all table path directory.
-            File[] tableDirs = FileUtils.listDirectories(dbDir);
-            for (File tableDir : tableDirs) {
-                // maybe tablet directories or partition directories
-                File[] tabletOrPartitionDirs = FileUtils.listDirectories(tableDir);
-
-                List<File> tabletDirs = new ArrayList<>();
-                for (File tabletOrPartitionDir : tabletOrPartitionDirs) {
-                    // if not partition dir, consider it as a tablet dir
-                    if (!isPartitionDir(tabletOrPartitionDir.getName())) {
-                        tabletDirs.add(tabletOrPartitionDir);
-                    } else {
-                        // consider all dirs in partition as tablet dirs
-                        tabletDirs.addAll(
-                                Arrays.asList(FileUtils.listDirectories(tabletOrPartitionDir)));
-                    }
-                }
-
-                // it may contain the directory for kv tablet and log tablet
-                // filter out the directory for specific type tablet
-                // actually it identified by the prefix of the directory
-                tabletsToLoad.addAll(
-                        tabletDirs.stream()
-                                .filter(
-                                        tabletDir ->
-                                                tabletDir.getName().startsWith(tabletDirPrefix))
-                                .collect(Collectors.toList()));
-            }
-        }
-
-        return tabletsToLoad;
+        Map<File, List<File>> allTabletDirs = getTabletDirs();
+        return allTabletDirs.values().stream()
+                .filter(Objects::nonNull)
+                .flatMap(List::stream)
+                .collect(Collectors.toList());
     }
 
     protected ExecutorService createThreadPool(String poolName) {
@@ -171,6 +204,27 @@ public abstract class TabletManagerBase {
      *
      * @param tablePath the table path of the bucket
      * @param tableBucket the table bucket
+     * @param dataDir the data directory
+     * @return the tablet directory
+     */
+    protected File getOrCreateTabletDir(
+            PhysicalTablePath tablePath, TableBucket tableBucket, File dataDir) {
+        File tabletDir = getTabletDir(tablePath, tableBucket, dataDir);
+        if (tabletDir.exists()) {
+            return tabletDir;
+        }
+        createTabletDirectory(tabletDir);
+        return tabletDir;
+    }
+
+    /**
+     * Get the tablet directory with given directory name for the given table path and table bucket.
+     *
+     * <p>When the parent directory of the tablet directory is missing, it will create the
+     * directory.
+     *
+     * @param tablePath the table path of the bucket
+     * @param tableBucket the table bucket
      * @return the tablet directory
      */
     protected File getOrCreateTabletDir(PhysicalTablePath tablePath, TableBucket tableBucket) {
@@ -182,11 +236,13 @@ public abstract class TabletManagerBase {
         return tabletDir;
     }
 
-    public Path getTabletParentDir(PhysicalTablePath tablePath, TableBucket tableBucket) {
-        return getTabletDir(tablePath, tableBucket).toPath().getParent();
+    protected File getTabletDir(PhysicalTablePath tablePath, TableBucket tableBucket) {
+        File dataDir = getPreferredDataDir();
+        return getTabletDir(tablePath, tableBucket, dataDir);
     }
 
-    protected File getTabletDir(PhysicalTablePath tablePath, TableBucket tableBucket) {
+    protected File getTabletDir(
+            PhysicalTablePath tablePath, TableBucket tableBucket, File dataDir) {
         switch (tabletType) {
             case LOG:
                 return FlussPaths.logTabletDir(dataDir, tablePath, tableBucket);
@@ -239,17 +295,6 @@ public abstract class TabletManagerBase {
             } else {
                 throw new LogStorageException(errorMsg, e);
             }
-        }
-    }
-
-    private static String getTabletDirPrefix(TabletType tabletType) {
-        switch (tabletType) {
-            case LOG:
-                return LOG_TABLET_DIR_PREFIX;
-            case KV:
-                return KV_TABLET_DIR_PREFIX;
-            default:
-                throw new IllegalArgumentException("Unknown tablet type: " + tabletType);
         }
     }
 }

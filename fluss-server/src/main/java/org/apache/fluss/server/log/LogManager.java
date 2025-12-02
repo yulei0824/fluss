@@ -57,6 +57,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
@@ -97,8 +98,10 @@ public final class LogManager extends TabletManagerBase {
     private volatile OffsetCheckpointFile recoveryPointCheckpoint;
     private boolean loadLogsCompletedFlag = false;
 
+    private final File checkpointDir;
+    private final File cleanShutdownDir;
+
     private LogManager(
-            File dataDir,
             Configuration conf,
             ZooKeeperClient zkClient,
             int recoveryThreadsPerDataDir,
@@ -106,14 +109,16 @@ public final class LogManager extends TabletManagerBase {
             Clock clock,
             TabletServerMetricGroup serverMetricGroup)
             throws Exception {
-        super(TabletType.LOG, dataDir, conf, recoveryThreadsPerDataDir);
+        super(TabletType.LOG, conf, recoveryThreadsPerDataDir);
         this.zkClient = zkClient;
         this.scheduler = scheduler;
         this.clock = clock;
         this.serverMetricGroup = serverMetricGroup;
-        createAndValidateDataDir(dataDir);
+        createAndValidateDataDirs();
 
+        checkpointDir = dataDirs.get(0);
         initializeCheckpointMaps();
+        cleanShutdownDir = dataDirs.get(0);
     }
 
     public static LogManager create(
@@ -123,10 +128,7 @@ public final class LogManager extends TabletManagerBase {
             Clock clock,
             TabletServerMetricGroup serverMetricGroup)
             throws Exception {
-        String dataDirString = conf.getString(ConfigOptions.DATA_DIR);
-        File dataDir = new File(dataDirString).getAbsoluteFile();
         return new LogManager(
-                dataDir,
                 conf,
                 zkClient,
                 conf.getInt(ConfigOptions.NETTY_SERVER_NUM_WORKER_THREADS),
@@ -141,23 +143,22 @@ public final class LogManager extends TabletManagerBase {
         // TODO add more scheduler, like log-flusher etc.
     }
 
-    public File getDataDir() {
-        return dataDir;
+    public File getCheckpointDir() {
+        return checkpointDir;
     }
 
     private void initializeCheckpointMaps() throws IOException {
         recoveryPointCheckpoint =
-                new OffsetCheckpointFile(new File(dataDir, RECOVERY_POINT_CHECKPOINT_FILE));
+                new OffsetCheckpointFile(new File(checkpointDir, RECOVERY_POINT_CHECKPOINT_FILE));
     }
 
     /** Recover and load all logs in the given data directories. */
     private void loadLogs() {
-        LOG.info("Loading logs from dir {}", dataDir);
+        LOG.info("Loading logs from data directories {}", dataDirs);
 
-        String dataDirAbsolutePath = dataDir.getAbsolutePath();
         try {
             boolean isCleanShutdown = false;
-            File cleanShutdownFile = new File(dataDir, CLEAN_SHUTDOWN_FILE);
+            File cleanShutdownFile = new File(cleanShutdownDir, CLEAN_SHUTDOWN_FILE);
             if (cleanShutdownFile.exists()) {
                 // Cache the clean shutdown status marker and use that for rest of log loading
                 // workflow. Delete the CleanShutdownFile so that if tabletServer crashes while
@@ -173,13 +174,21 @@ public final class LogManager extends TabletManagerBase {
                 LOG.warn(
                         "Error occurred while reading recovery-point-offset-checkpoint file of directory {}, "
                                 + "resetting the recovery checkpoint to 0",
-                        dataDirAbsolutePath,
+                        checkpointDir.getAbsolutePath(),
                         e);
             }
 
             List<File> tabletsToLoad = listTabletsToLoad();
-            if (tabletsToLoad.isEmpty()) {
-                LOG.info("No logs found to be loaded in {}", dataDirAbsolutePath);
+            List<File> logTabletsToLoad =
+                    tabletsToLoad.stream()
+                            .filter(
+                                    tabletDir ->
+                                            tabletDir
+                                                    .getName()
+                                                    .startsWith(FlussPaths.LOG_TABLET_DIR_PREFIX))
+                            .collect(Collectors.toList());
+            if (logTabletsToLoad.isEmpty()) {
+                LOG.info("No logs found to be loaded in {}", dataDirs);
             } else if (isCleanShutdown) {
                 LOG.info("Skipping some recovery log process since clean shutdown file was found");
             } else {
@@ -195,8 +204,7 @@ public final class LogManager extends TabletManagerBase {
 
             long startTime = System.currentTimeMillis();
 
-            int successLoadCount =
-                    runInThreadPool(jobsForDir, "log-recovery-" + dataDirAbsolutePath);
+            int successLoadCount = runInThreadPool(jobsForDir, "log-recovery");
 
             loadLogsCompletedFlag = true;
             LOG.info(
@@ -372,41 +380,41 @@ public final class LogManager extends TabletManagerBase {
 
     private void createAndValidateDataDir(File dataDir) {
         try {
-            inLock(
-                    logCreationOrDeletionLock,
-                    () -> {
-                        if (!dataDir.exists()) {
-                            LOG.info(
-                                    "Data directory {} not found, creating it.",
-                                    dataDir.getAbsolutePath());
-                            boolean created = dataDir.mkdirs();
-                            if (!created) {
-                                throw new IOException(
-                                        "Failed to create data directory "
-                                                + dataDir.getAbsolutePath());
-                            }
-                            Path parentPath =
-                                    dataDir.toPath().toAbsolutePath().normalize().getParent();
-                            FileUtils.flushDir(parentPath);
-                        }
-                        if (!dataDir.isDirectory() || !dataDir.canRead()) {
-                            throw new IOException(
-                                    dataDir.getAbsolutePath()
-                                            + " is not a readable data directory.");
-                        }
-                    });
+            if (!dataDir.exists()) {
+                LOG.info("Data directory {} not found, creating it.", dataDir.getAbsolutePath());
+                boolean created = dataDir.mkdirs();
+                if (!created) {
+                    throw new IOException(
+                            "Failed to create data directory " + dataDir.getAbsolutePath());
+                }
+                Path parentPath = dataDir.toPath().toAbsolutePath().normalize().getParent();
+                FileUtils.flushDir(parentPath);
+            }
+            if (!dataDir.isDirectory() || !dataDir.canRead()) {
+                throw new IOException(
+                        dataDir.getAbsolutePath() + " is not a readable data directory.");
+            }
         } catch (IOException e) {
             throw new FlussRuntimeException(
                     "Failed to create or validate data directory " + dataDir.getAbsolutePath(), e);
         }
     }
 
+    private void createAndValidateDataDirs() {
+        inLock(
+                logCreationOrDeletionLock,
+                () -> {
+                    for (File dataDir : dataDirs) {
+                        createAndValidateDataDir(dataDir);
+                    }
+                });
+    }
+
     /** Close all the logs. */
     public void shutdown() {
         LOG.info("Shutting down LogManager.");
 
-        String dataDirAbsolutePath = dataDir.getAbsolutePath();
-        ExecutorService pool = createThreadPool("log-tablet-closing-" + dataDirAbsolutePath);
+        ExecutorService pool = createThreadPool("log-tablet-closing");
 
         List<LogTablet> logs = new ArrayList<>(currentLogs.values());
         List<Future<?>> jobsForTabletDir = new ArrayList<>();
@@ -444,7 +452,7 @@ public final class LogManager extends TabletManagerBase {
             if (loadLogsCompletedFlag) {
                 LOG.debug("Writing clean shutdown marker.");
                 try {
-                    Files.createFile(new File(dataDir, CLEAN_SHUTDOWN_FILE).toPath());
+                    Files.createFile(new File(cleanShutdownDir, CLEAN_SHUTDOWN_FILE).toPath());
                 } catch (IOException e) {
                     LOG.warn("Failed to write clean shutdown marker.", e);
                 }
@@ -456,6 +464,35 @@ public final class LogManager extends TabletManagerBase {
         LOG.info("Shut down LogManager complete.");
     }
 
+    private Map<Tuple2<PhysicalTablePath, TableBucket>, Tuple2<File, File>> groupByTableBucket(
+            List<File> tabletDirs) {
+        Map<Tuple2<PhysicalTablePath, TableBucket>, Tuple2<File, File>> tableBucketTabletTuples =
+                new HashMap<>();
+        for (File tabletDir : tabletDirs) {
+            Tuple2<PhysicalTablePath, TableBucket> tableBucket =
+                    FlussPaths.parseTabletDir(tabletDir);
+            Tuple2<File, File> tabletTuple = tableBucketTabletTuples.get(tableBucket);
+            if (tabletDir.getName().startsWith(FlussPaths.LOG_TABLET_DIR_PREFIX)) {
+                if (tabletTuple == null) {
+                    tabletTuple = Tuple2.of(tabletDir, null);
+                    tableBucketTabletTuples.put(tableBucket, tabletTuple);
+                } else {
+                    tabletTuple.f0 = tabletDir;
+                }
+            } else if (tabletDir.getName().startsWith(FlussPaths.KV_TABLET_DIR_PREFIX)) {
+                if (tabletTuple == null) {
+                    tabletTuple = Tuple2.of(null, tabletDir);
+                    tableBucketTabletTuples.put(tableBucket, tabletTuple);
+                } else {
+                    tabletTuple.f1 = tabletDir;
+                }
+            } else {
+                throw new IllegalArgumentException("Invalid tablet directory " + tabletDir);
+            }
+        }
+        return tableBucketTabletTuples;
+    }
+
     /** Create runnable jobs for loading logs from tablet directories. */
     private Runnable[] createLogLoadingJobs(
             List<File> tabletsToLoad,
@@ -463,17 +500,29 @@ public final class LogManager extends TabletManagerBase {
             Map<TableBucket, Long> recoveryPoints,
             Configuration conf,
             Clock clock) {
-        Runnable[] jobs = new Runnable[tabletsToLoad.size()];
-        for (int i = 0; i < tabletsToLoad.size(); i++) {
-            final File tabletDir = tabletsToLoad.get(i);
-            jobs[i] = createLogLoadingJob(tabletDir, cleanShutdown, recoveryPoints, conf, clock);
+        Map<Tuple2<PhysicalTablePath, TableBucket>, Tuple2<File, File>> tableBucketTabletTuples =
+                groupByTableBucket(tabletsToLoad);
+        List<Tuple2<File, File>> tabletDirTuples =
+                new ArrayList<>(tableBucketTabletTuples.values());
+        Runnable[] jobs = new Runnable[tabletDirTuples.size()];
+        for (int i = 0; i < tabletDirTuples.size(); i++) {
+            final Tuple2<File, File> tabletDirTuple = tabletDirTuples.get(i);
+            jobs[i] =
+                    createLogLoadingJob(
+                            tabletDirTuple.f0,
+                            tabletDirTuple.f1,
+                            cleanShutdown,
+                            recoveryPoints,
+                            conf,
+                            clock);
         }
         return jobs;
     }
 
     /** Create a runnable job for loading log from a single tablet directory. */
     private Runnable createLogLoadingJob(
-            File tabletDir,
+            File logTabletDir,
+            File kvTabletDir,
             boolean cleanShutdown,
             Map<TableBucket, Long> recoveryPoints,
             Configuration conf,
@@ -481,25 +530,20 @@ public final class LogManager extends TabletManagerBase {
         return new Runnable() {
             @Override
             public void run() {
-                LOG.debug("Loading log {}", tabletDir);
+                LOG.debug("Loading log {}", logTabletDir);
                 try {
-                    loadLog(tabletDir, cleanShutdown, recoveryPoints, conf, clock);
+                    loadLog(logTabletDir, cleanShutdown, recoveryPoints, conf, clock);
                 } catch (Exception e) {
-                    LOG.error("Fail to loadLog from {}", tabletDir, e);
+                    LOG.error("Fail to loadLog from {}", logTabletDir, e);
                     if (e instanceof SchemaNotExistException) {
                         LOG.error(
                                 "schema not exist, table for {} has already been dropped, the residual data will be removed.",
-                                tabletDir,
+                                logTabletDir,
                                 e);
-                        FileUtils.deleteDirectoryQuietly(tabletDir);
+                        FileUtils.deleteDirectoryQuietly(logTabletDir);
 
                         // Also delete corresponding KV tablet directory if it exists
                         try {
-                            Tuple2<PhysicalTablePath, TableBucket> pathAndBucket =
-                                    FlussPaths.parseTabletDir(tabletDir);
-                            File kvTabletDir =
-                                    FlussPaths.kvTabletDir(
-                                            dataDir, pathAndBucket.f0, pathAndBucket.f1);
                             if (kvTabletDir.exists()) {
                                 LOG.info(
                                         "Also removing corresponding KV tablet directory: {}",
@@ -508,8 +552,9 @@ public final class LogManager extends TabletManagerBase {
                             }
                         } catch (Exception kvDeleteException) {
                             LOG.warn(
-                                    "Failed to delete corresponding KV tablet directory for log {}: {}",
-                                    tabletDir,
+                                    "Failed to delete corresponding KV tablet directory {} for log {}: {}",
+                                    kvTabletDir,
+                                    logTabletDir,
                                     kvDeleteException.getMessage());
                         }
                         return;
@@ -533,7 +578,7 @@ public final class LogManager extends TabletManagerBase {
             } catch (Exception e) {
                 throw new LogStorageException(
                         "Disk error while writing recovery offsets checkpoint in directory "
-                                + dataDir
+                                + checkpointDir
                                 + ": "
                                 + e.getMessage(),
                         e);
