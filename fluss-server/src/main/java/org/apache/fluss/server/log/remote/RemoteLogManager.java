@@ -109,7 +109,7 @@ public class RemoteLogManager implements Closeable {
         this.zkClient = zkClient;
         this.coordinatorGateway = coordinatorGateway;
 
-        File dataDir = new File(conf.getString(ConfigOptions.DATA_DIR));
+        File dataDir = new File(conf.getString(ConfigOptions.REMOTE_LOG_INDEX_CACHE_DIR));
         this.remoteLogIndexCache =
                 new RemoteLogIndexCache(
                         (int) conf.get(ConfigOptions.REMOTE_LOG_INDEX_FILE_CACHE_SIZE).getBytes(),

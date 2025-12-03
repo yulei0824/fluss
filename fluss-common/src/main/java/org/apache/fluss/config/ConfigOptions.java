@@ -767,6 +767,14 @@ public class ConfigOptions {
                             "The number of threads the server uses to transfer (download and upload) "
                                     + "remote log file can be  data file, index file and remote log metadata file.");
 
+    public static final ConfigOption<String> REMOTE_LOG_INDEX_CACHE_DIR =
+            key("remote.log.index-cache.dir")
+                    .stringType()
+                    .defaultValue("/tmp/fluss-data")
+                    .withDescription(
+                            "This configuration controls the directory where fluss will store remote log index cache data. "
+                                    + "The default value is /tmp/fluss-data");
+
     // ------------------------------------------------------------------------
     //  Netty Settings
     // ------------------------------------------------------------------------
