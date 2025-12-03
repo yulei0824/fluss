@@ -111,7 +111,7 @@ public abstract class TabletManagerBase {
     }
 
     private Map<File, List<File>> getTabletDirs() {
-        checkState(dataDirs.isEmpty(), "The number of data directories is zero.");
+        checkState(!dataDirs.isEmpty(), "The number of data directories is zero.");
 
         Map<File, List<File>> tabletDirs = new HashMap<>();
         for (File dataDir : dataDirs) {
