@@ -224,7 +224,11 @@ public final class LogTablet {
     }
 
     public File getDataDir() {
-        return null;
+        Path tableDir =
+                getPartitionName() == null
+                        ? getLogDir().toPath().getParent()
+                        : getLogDir().toPath().getParent().getParent();
+        return tableDir.getParent().getParent().toFile();
     }
 
     public long getRecoveryPoint() {
