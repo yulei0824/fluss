@@ -347,7 +347,7 @@ public final class Replica {
     }
 
     public Path getTabletParentDir() {
-        return logManager.getTabletParentDir(physicalPath, tableBucket);
+        return logTablet.getLogDir().toPath().getParent();
     }
 
     public @Nullable KvTablet getKvTablet() {
@@ -670,7 +670,9 @@ public final class Replica {
                         physicalPath);
                 CompletedSnapshot completedSnapshot = optCompletedSnapshot.get();
                 // always create a new dir for the kv tablet
-                File tabletDir = kvManager.createTabletDir(physicalPath, tableBucket);
+                File tabletDir =
+                        kvManager.createTabletDir(
+                                physicalPath, tableBucket, logTablet.getDataDir());
                 // down the snapshot to target tablet dir
                 downloadKvSnapshots(completedSnapshot, tabletDir.toPath());
 

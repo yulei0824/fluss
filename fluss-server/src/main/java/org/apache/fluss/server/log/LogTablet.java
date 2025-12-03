@@ -223,6 +223,10 @@ public final class LogTablet {
         return localLog.getLogTabletDir();
     }
 
+    public File getDataDir() {
+        return null;
+    }
+
     public long getRecoveryPoint() {
         return localLog.getRecoveryPoint();
     }

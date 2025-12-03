@@ -244,7 +244,7 @@ public class ReplicaManager {
         this.highWatermarkCheckpoint =
                 new OffsetCheckpointFile(
                         new File(
-                                logManager.getDataDir().getAbsolutePath(),
+                                logManager.getCheckpointDir().getAbsolutePath(),
                                 HIGH_WATERMARK_CHECKPOINT_FILE_NAME));
         this.delayedWriteManager =
                 new DelayedOperationManager<>(
