@@ -200,7 +200,7 @@ public final class LogManager extends TabletManagerBase {
             // set runnable job.
             Runnable[] jobsForDir =
                     createLogLoadingJobs(
-                            tabletsToLoad, cleanShutdown, finalRecoveryPoints, conf, clock);
+                            logTabletsToLoad, cleanShutdown, finalRecoveryPoints, conf, clock);
 
             long startTime = System.currentTimeMillis();
 
