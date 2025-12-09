@@ -141,8 +141,7 @@ public abstract class TabletManagerBase {
         return tabletDirs;
     }
 
-    private File getPreferredDataDir() {
-        Map<File, List<File>> allTabletDirs = getTabletDirs();
+    static File getPreferredDataDir(Map<File, List<File>> allTabletDirs) {
         Map.Entry<File, List<File>> preferredDataDir =
                 allTabletDirs.entrySet().stream()
                         .sorted(
@@ -237,7 +236,7 @@ public abstract class TabletManagerBase {
     }
 
     protected File getTabletDir(PhysicalTablePath tablePath, TableBucket tableBucket) {
-        File dataDir = getPreferredDataDir();
+        File dataDir = getPreferredDataDir(getTabletDirs());
         return getTabletDir(tablePath, tableBucket, dataDir);
     }
 
